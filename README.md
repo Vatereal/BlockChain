@@ -111,5 +111,3 @@ This table contains one row for each **input** and for each **output address** i
 - **No mempool data:** Only confirmed on-chain data is captured.
 - **Address decoding:** Addresses depend on what `bitcoind` exposes in `scriptPubKey.address` / `scriptPubKey.addresses`. Non-standard scripts may have `address = null`.
 - **Input values:** Input `value` is **not** directly stored; you must join inputs to their originating outputs to recover exact amounts.
-
-This metadata should give you enough context to safely use the `blocks`, `txs`, and `io` folders for downstream analytics, UTXO tracking, and fee/weight studies.
