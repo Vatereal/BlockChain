@@ -111,3 +111,197 @@ This table contains one row for each **input** and for each **output address** i
 - **No mempool data:** Only confirmed on-chain data is captured.
 - **Address decoding:** Addresses depend on what `bitcoind` exposes in `scriptPubKey.address` / `scriptPubKey.addresses`. Non-standard scripts may have `address = null`.
 - **Input values:** Input `value` is **not** directly stored; you must join inputs to their originating outputs to recover exact amounts.
+
+
+# Patch Note #1
+
+# Experiment Change Log — Entity Clustering Pipeline (2014)
+
+This document summarizes the major experimental changes introduced during the recent iteration cycle (Patch A / Patch B and supporting fixes), how they affected results, and what design invariants were intentionally preserved.
+
+---
+
+## Baseline (Pre-patch) Snapshot
+
+### Core pipeline behavior
+- **Outpoint preload** into SQLite to resolve inputs (`prev_txid`, `prev_vout`) → (`address`, `value_sats`).
+- **Union-Find** over addresses (nodes), producing entity clusters.
+- Heuristics:
+  - **H1 (multi-input)** under a conservative “SAFE” policy (`one_output` or `one_or_two_nonmix`).
+  - **Tight change heuristic** (2-output default) with type consistency and anti-reuse constraint.
+  - **Mixing-like filter** to skip likely CoinJoin / mixers.
+- Diagnostics:
+  - Summary stats (clusters, top entities, percentiles).
+  - Prevout hit-rate sanity.
+
+### Primary issue motivating changes
+- Large/mega clusters were either:
+  - **Over-prevented** (too strict caps / guards), or
+  - **Over-formed** without visibility (hard to distinguish “real” mega-entities from pathological bridging).
+- Lack of instrumentation around “why” large merges were being blocked (or allowed).
+
+---
+
+## Patch A — Mega-entity support + stronger ultra-large merge rules
+
+### What changed
+1. **Raised absolute cap (`max_merged_component_size`)**
+   - Previously: smaller cap could suppress formation of very large entities.
+   - Now: cap raised (example used: **10,000,000**) to allow mega-entities, but still acts as a **safety fuse**.
+
+2. **Strengthened merge governance for ultra-large components**
+   - Introduced tiered vote requirements (`ultra_change_vote_rules`) above large thresholds:
+     - Example tiers:
+       - ≥ 250k ⇒ 3 votes
+       - ≥ 500k ⇒ 4 votes
+       - ≥ 1M  ⇒ 5 votes
+   - This is enforced **only on CHANGE merges** (not H1).
+
+3. **Ratio guard refinement for CHANGE merges**
+   - Ratio guard prevents merging vastly different component sizes, but:
+   - Added a **small-component floor** so singleton/tiny change attachments don’t “freeze” the change heuristic:
+     - Ratio guard applies only when:
+       - `small >= merge_ratio_small_floor`
+       - `big >= merge_ratio_big_cluster_min`
+
+4. **Fix: guard logging state**
+   - Resolved failure: `ratio_guard_samples_written` scope (`nonlocal`) issue caused runtime exception.
+
+### Intended effect
+- Allow realistic mega-entities to form **when supported**, while reducing “one-off” pathological bridging into enormous clusters.
+- Prevent the pipeline from collapsing into a single massive entity due to weak control at the high end.
+
+### Observed effect (2014 run)
+- Mega cluster formation became possible under the new ceiling.
+- Largest cluster increased substantially:
+  - Example observed:
+    - Largest cluster size grew from ~**1.5M (4.48%)** to ~**2.31M (6.91%)**.
+- Vote gating did **not** dominate runtime:
+  - Many merges proceeded without needing repeated confirmations.
+  - Skips were primarily **ratio-guard** under CHANGE in the later run.
+
+---
+
+## Patch B — Constraint logging + diagnosing “repeat-edge” scarcity
+
+Patch B was motivated by the hypothesis:
+> “If we gate big merges by repeated observations of the same bridge edge, but those bridges are rarely repeated, the vote system will be idle and won’t provide meaningful confirmation.”
+
+### What changed
+
+1. **Constraint-event logging (vote gating)**
+   - Added a log that records when a CHANGE merge is blocked because votes are not yet sufficient.
+   - Key goal: determine whether constrained pairs are:
+     - Mostly **unique** (rare repetition), or
+     - Frequently **repeated** (vote gating will work well).
+
+2. **Uniqueness / repetition counters**
+   - Track:
+     - Total gating evaluations
+     - Unique constrained pairs
+     - Pairs that repeat at least once
+   - This directly tests whether “repeat the exact same bridge” is a viable confirmation signal.
+
+3. **Degree-based alternative guard (bridge-y change behavior proxy)**
+   - Added an additional mechanism for cases where exact-pair repetition is rare:
+   - For CHANGE merges only:
+     - Track how many **distinct large anchors** a given change component attempts to attach to.
+     - If the change component tries to attach to too many distinct large components, block further attachments.
+   - Motivation:
+     - A pathological change component that becomes a “hub” bridging multiple large entities is suspicious even if exact edge repetition is rare.
+
+### Observed effect (2014 run)
+- Constraint-event log showed **n=0** in at least one run:
+  - This indicates the configured vote gating thresholds were not being triggered *in that run’s conditions*, or merges were not entering the big–big regime.
+- This reinforced the earlier concern:
+  - If constraints are not triggered (or if pairs are unique), “repeat-edge voting” cannot be relied upon as the primary confirmation signal.
+- Degree-guard becomes the more meaningful control when repetition is scarce.
+
+---
+
+## Confidence Proxy Output — Address-level clustering likelihood proxy
+
+### What changed
+- Added `address_confidence_YYYY.parquet` output:
+  - Columns:
+    - `address`
+    - `entity_id`
+    - `p_clustered_proxy` (proxy score ∈ (0,1))
+    - Optional: `cluster_size`, `evidence_bits`
+
+### Evidence used
+- Evidence bits (address-level):
+  - Multi-input evidence
+  - Change output evidence
+  - Change anchor evidence
+- Cluster size contributes a saturating bonus (log scale).
+
+### Intended use
+- Downstream weighting / filtering:
+  - Give lower weight to singleton clusters or weakly evidenced links.
+  - Highlight addresses/entities with stronger heuristic support.
+
+### What it does *not* claim
+- This is **not a calibrated probability**.
+- It is a structured “confidence score” proxy.
+
+---
+
+## Performance / Engineering Preservations
+
+The following design constraints were intentionally preserved:
+
+1. **Node universe preservation**
+   - Maintained: `create_nodes_for_all_resolved_inputs=True`
+   - Ensures UF nodes exist for all resolved input addresses, preventing distortions due to node creation policy.
+
+2. **Determinism safeguards**
+   - Sorted address lists after `group_concat(DISTINCT ...)`.
+   - Sorted unique address sets before node creation.
+
+3. **Set-based prevout resolution**
+   - Preserved and relied on:
+     - `vinbuf` temp table
+     - SQLite join aggregation
+     - Polars transport
+   - This produced very high DB hit-rates and stable performance.
+
+4. **Heuristic conservatism**
+   - Kept tight change detection and mixing-like skip logic.
+   - Vote + degree controls apply only to **CHANGE**, not multi-input H1.
+
+---
+
+## Summary of Net Impact
+
+### Main behavioral shifts
+- The pipeline now **permits mega entities** (cap raised) but includes **stronger governance** for large merges:
+  - ultra vote tiers (Patch A)
+  - improved ratio guard applicability (Patch A)
+  - visibility into constraint mechanisms (Patch B)
+  - alternative guard when repetition is scarce (Patch B)
+
+### Practical outcomes observed
+- Largest cluster size increased meaningfully in the 2014 run.
+- Constraint logging indicated the earlier “repeat-edge” assumption may not hold in practice (constraints often not triggered / pairs not repeated).
+- Confidence proxy was successfully generated at full address scale (~33.4M rows).
+
+---
+
+## What to Watch Next (Suggested Diagnostic Questions)
+
+1. **Is the largest cluster “real” or an artifact?**
+   - Inspect whether its growth is driven mostly by CHANGE merges or H1 merges.
+   - If mostly CHANGE: focus on ratio/degree/vote tuning.
+
+2. **Do constrained pairs repeat?**
+   - If repetition is truly rare, edge-repetition voting will remain low-value.
+   - Prefer degree-based or other “structure” signals.
+
+3. **Does the degree guard block too aggressively?**
+   - Monitor how often degree-guard triggers and whether it blocks merges that appear legitimate.
+
+4. **Does the confidence proxy correlate with downstream truth?**
+   - Validate proxy with any available labels or with manual inspection of known services/exchanges.
+
+---
