@@ -113,6 +113,258 @@ This table contains one row for each **input** and for each **output address** i
 - **Input values:** Input `value` is **not** directly stored; you must join inputs to their originating outputs to recover exact amounts.
 
 
+# Patch Note #0
+
+# Experiment change log (Bitcoin address clustering)
+
+This document summarizes what changed across iterations of the clustering pipeline, why it was changed, how it affected results, and what was ultimately preserved.
+
+---
+
+## Baseline goal
+
+Cluster Bitcoin **addresses** into **entities** (connected components) using Union-Find (UF), where edges come from heuristics:
+
+- **Multi-input heuristic**: addresses that co-spend in one transaction are likely controlled by one entity.
+- **Change heuristic**: if one output is inferred as change back to the spender, link it to the spender.
+
+---
+
+# Iteration 0 — Initial “direct IO” approach (fails silently on real data)
+
+### What the algorithm assumed
+- Input rows (`dir == vin`) contain input **addresses** directly.
+- Output rows (`dir == vout`) contain output **addresses** directly.
+
+### What was actually true in the dataset
+- `dir` values were `in/out`, not `vin/vout`.
+- **Input rows had address = NULL** (because inputs reference previous outputs and do not directly store addresses).
+
+### Observed outcome
+- Either:
+  - the run crashed due to unexpected `dir` encoding, or
+  - it processed all files but ended with:
+    - `n_nodes == 0`
+    - “No addresses found … nothing to cluster.”
+
+### Key lesson
+**Inputs must be resolved via prevouts (UTXO model).** You cannot cluster inputs from the `in` rows without joining to previous outputs.
+
+**Preserved:** Union-Find clustering logic, overall per-tx heuristic design.
+
+---
+
+# Iteration 1 — Fix `dir` segmentation (`in/out`) and basic checks
+
+### Main change
+- Normalize `dir` to lowercase.
+- Treat `out` as outputs, and everything else as inputs (later refined to explicit `dir == "in"`).
+
+### Diagnostic checks added
+- Print unique `dir` values for first processed file(s).
+- Print per-dir row counts and address null/non-null counts.
+
+### Outcome
+- Confirmed:
+  - `dir ∈ {in, out}`
+  - input addresses were null almost always
+  - output addresses were mostly present
+
+### Key result impact
+- Still produced no meaningful clustering (no input addresses to union).
+- But made the data issue explicit and measurable.
+
+**Preserved:** multi-input/change idea, file scanning structure.
+
+---
+
+# Iteration 2 — Add prevout resolution with a SQLite outpoint index (core upgrade)
+
+### Main change (structural)
+Introduce an **outpoint database** to resolve input addresses:
+
+1. **Index outputs**: store `(txid, n) -> address` for outputs.
+2. For each input row: use `(prev_txid, prev_vout)` to lookup the address of the spent output.
+
+Implementation:
+- SQLite table: `outpoints(txid TEXT, n INTEGER, address TEXT, PRIMARY KEY(txid,n))`.
+
+### Why SQLite
+- Simple, durable, supports random lookup.
+- Avoids keeping an in-memory dictionary of all outpoints (too large).
+
+### Outcome
+- Inputs began resolving.
+- Multi-input heuristic began firing.
+- Cluster formation started working.
+
+### Additional improvements made shortly after
+- Chunked lookup (`OR`-clause batches) to reduce per-row `SELECT` overhead.
+- Index/PRAGMA tuning (`WAL`, `synchronous=OFF`, cache sizing) to speed up inserts/lookups.
+
+**Preserved:** union rules; changed only how input addresses are obtained.
+
+---
+
+# Iteration 3 — Introduce two time windows: INDEX vs ANALYSIS (correctness + coverage)
+
+### Main change
+Use two windows:
+
+- **Index window**: `[INDEX_START, ANALYSIS_END)`
+  Build outpoint DB so early-year spends can resolve.
+- **Analysis window**: `[ANALYSIS_START, ANALYSIS_END)`
+  Apply heuristics only in the target year.
+
+With lookback:
+- `INDEX_START = ANALYSIS_START - 365 days` (configurable)
+
+### Effect on results
+- Prevout hit-rate increased.
+- Multi-input heuristic coverage improved early in the year.
+- Reduced artificial fragmentation due to missing inputs.
+
+**Preserved:** heuristics unchanged; only added correct historical context for resolving inputs.
+
+---
+
+# Iteration 4 — Memory and scaling fixes (prevent RAM blowups)
+
+### Main changes
+1. **Stop pre-creating UF nodes for every seen output**
+   - `PRECREATE_NODES_FOR_ALL_OUTPUT_ADDRS = False` by default.
+   - Instead, track output “newness” via a Python set `seen_output_addrs`.
+
+2. **Chunked Parquet writing**
+   - Avoid building giant Python lists for `(address, entity_id)` output.
+   - Use `pyarrow.parquet.ParquetWriter` in batches (`ENTITY_WRITE_BATCH`).
+
+### Effect on results
+- Peak RAM reduced significantly.
+- Made year-scale runs feasible on ~40 GB RAM systems.
+- Output writing became stable for tens of millions of addresses.
+
+**Preserved:** core UF model and stats; improved memory handling only.
+
+---
+
+# Iteration 5 — Sanity checks + diagnostics (validate giant component)
+
+### Main changes
+Add explicit sanity checks:
+- largest cluster fraction of nodes
+- top-K cluster sizes
+- quantiles (median, p90, p99)
+- prevout lookup hit-rate
+
+### Observed results (typical run)
+- Heavy-tailed distribution + **giant component**
+- Example:
+  - largest cluster ~55% of nodes
+  - median ~2
+  - p90 ~6
+  - p99 ~23
+
+### Interpretation
+- Heavy tail is expected.
+- **Largest component dominance is a red flag**: could be real (big custodial/service cluster) or caused by overly permissive unions (especially change).
+
+**Preserved:** results reporting; added validation tooling.
+
+---
+
+# Iteration 6 — Change heuristic hardening (Option B “safe mode” direction)
+
+### Why change was targeted
+Change union is the main source of **false bridges**:
+- One wrong change link can connect two large components and cause cascading merges.
+
+### Conservative constraints introduced/considered
+- Require **exactly one** candidate output after filters.
+- Enforce:
+  - script/type match with majority input type
+  - strong “newness” constraint (never seen output before)
+  - optional tx-shape constraints (e.g., `n_out in {2,3}`)
+  - optional amount logic (avoid “payment-looking” output)
+
+### Effect on results
+- Fewer change unions.
+- More fragmentation:
+  - more clusters
+  - smaller medium clusters
+  - (ideally) reduced giant-component size if change was the bridge driver
+- Zipf curve becomes steeper and rank-1 dominance should shrink if false bridges were removed.
+
+**Preserved:** multi-input heuristic (core), CoinJoin-ish skip, UF framework.
+
+---
+
+# Iteration 7 — Plotting overhaul (make distributions interpretable)
+
+### Problem
+Naïve histograms become unreadable due to:
+- heavy-tailed sizes
+- one giant outlier dominating x-range
+
+### Main changes
+Produce 4 focused plots:
+1. All clusters — log-spaced bins, log axes
+2. Excluding largest cluster — reveals “typical” entities
+3. Zoom ≤ 2048 — bulk behavior
+4. Zipf (rank-size) — tail shape and dominance
+
+Improvements:
+- visible bin edges (black)
+- grid and labeled axes
+- distinct colors per plot
+
+### Effect on results
+- Distribution became interpretable.
+- Could visually confirm “giant outlier + long tail” pattern.
+- Easier to compare “before vs after” change-hardening runs.
+
+**Preserved:** same computed cluster sizes; only visualization changed.
+
+---
+
+# What was preserved throughout (stable design decisions)
+
+- **Union-Find** as the clustering backbone (efficient connected components).
+- **Multi-input heuristic** as the primary high-signal clustering edge.
+- **CoinJoin-ish skip** to avoid collaborative transaction linkage (simple equal-output filter).
+- Year-scoped analysis with lookback indexing for correctness.
+- Node-level coverage flags (`multi-input`, `change`) for diagnostics.
+
+---
+
+# Net effect summary (high-level)
+
+| Change | Main purpose | Effect on output |
+|---|---|---|
+| Fix `dir` encoding | Correct segmentation | Enabled correct grouping |
+| Prevout resolution (SQLite) | Get input addresses | Made clustering possible |
+| INDEX vs ANALYSIS windows | Improve resolution coverage | Higher hit-rate, fewer missing inputs |
+| Disable pre-create nodes | Reduce RAM | Fewer forced singletons, stable memory |
+| Chunked Parquet writer | Avoid huge lists | Stable output on big runs |
+| Sanity stats | Validate correctness | Exposed giant component dominance |
+| Conservative change union | Reduce false bridges | Smaller giant cluster (ideally), more clusters |
+| Improved plots | Interpret heavy tails | Clearer comparisons across runs |
+
+---
+
+# Current state (as of latest code)
+
+The pipeline now:
+- resolves input addresses correctly via outpoint DB,
+- clusters using multi-input + conservative change,
+- scales to year-level datasets,
+- outputs mapping in chunked Parquet,
+- includes sanity metrics and interpretable plots.
+
+Primary remaining validation focus:
+- whether the largest component is “real service behavior” or residual over-linking.
+
+
 # Patch Note #1
 
 # Experiment Change Log — Entity Clustering Pipeline (2014)
