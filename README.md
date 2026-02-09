@@ -364,6 +364,359 @@ The pipeline now:
 Primary remaining validation focus:
 - whether the largest component is “real service behavior” or residual over-linking.
 
+# Patch Note #0.5
+
+# Experiment Change Log (Markdown)
+
+This summarizes **what changed**, **why it changed**, **how it affected runtime/behavior**, and **what we kept unchanged** across the iterations of your pipeline.
+
+---
+
+## Baseline
+
+### Baseline behavior
+- Read each parquet with Polars.
+- Normalize `dir` every file (`cast + lowercase`).
+- Build an SQLite outpoint index (txid, n → address, value_sats).
+- For analysis-window files: resolve inputs by querying SQLite in batches using **OR-chained WHERE clauses**.
+- Run:
+  - multi-input union heuristic
+  - conservative change heuristic
+  - coinjoin-like skip
+- Agg outputs per `txid` with `group_by().agg(list columns)`.
+- Aggressive cleanup: frequent `gc.collect()` calls.
+
+### Observed baseline runtime
+- ~**19:45** (your measurement).
+
+---
+
+## Change Set A — Instrumentation and progress reporting
+
+### A1) Added `tqdm` per-parquet progress
+**Change**
+- Wrapped eligible files iteration in a `tqdm` progress bar.
+- Reduced printing to avoid flooding stdout.
+
+**Rationale**
+- Provide visibility into progress and phase (preload vs analysis).
+
+**Expected/Observed impact**
+- `tqdm` has **non-trivial overhead** if updated too frequently.
+- Mitigation added later via `mininterval`, `miniters`, and sparse postfix updates.
+
+**Safety**
+- No changes to logic or results; instrumentation only.
+
+**Preserved**
+- All heuristics and DB behavior unchanged.
+
+---
+
+## Change Set B — SQLite write path optimizations (outpoints indexing)
+
+### B1) “Commit once per file” → “Long transaction + periodic commits”
+**Change**
+- Replaced per-file `conn.commit()` with:
+  - `conn.isolation_level = None` (manual transaction control)
+  - `BEGIN;` once
+  - periodic `COMMIT; BEGIN;` after `OUTPOINT_COMMIT_EVERY_ROWS` inserts
+
+**Rationale**
+- SQLite commit cost is high; batching inserts is usually the single biggest speed win.
+
+**Impact**
+- Typically **large speedup** when commit frequency was a bottleneck.
+- Tradeoff: slightly more “work at risk” if the process crashes before a commit.
+  - Mitigated by choosing a smaller threshold (e.g. 500k rows).
+
+**Safety**
+- Correctness preserved:
+  - same inserts
+  - same `INSERT OR IGNORE` semantics
+- Only changes durability timing.
+
+**Preserved**
+- Schema, primary key (`txid,n`), and insert semantics.
+
+---
+
+## Change Set C — SQLite read path optimizations (prevout lookups)
+
+### C1) OR-chunk lookup (baseline)
+**Mechanism**
+- Chunk keys into groups (e.g. 500)
+- `WHERE (txid=? AND n=?) OR ...`
+- `fetchall()`
+
+**Pros**
+- Very good for **small key sets**
+- Avoids temp table creation / btree operations
+
+**Cons**
+- Gets slower as chunk size grows (query planning + SQL string building costs).
+
+---
+
+### C2) Temp-table JOIN lookup
+**Change**
+- Introduced a temp table `keybuf(txid,n)` and did:
+  - delete keybuf
+  - bulk insert chunk of keys
+  - `JOIN outpoints o ON o.txid=k.txid AND o.n=k.n`
+
+**Rationale**
+- JOIN can be much faster for large lookups than enormous OR clauses.
+
+**Impact**
+- Can improve speed when key set per file is large.
+- But can also degrade performance if:
+  - the chunk sizes are not tuned,
+  - temp table has a PK/index that creates btree maintenance overhead,
+  - keybuf is re-created too often,
+  - overhead dominates compared to OR for “medium” key counts.
+
+**Safety**
+- Correctness preserved as long as:
+  - keys are exactly the same
+  - join conditions match `(txid,n)` properly
+
+**Preserved**
+- Same lookup outputs (address,value_sats) for resolved keys.
+
+---
+
+### C3) Patched JOIN variant (no PK on keybuf)
+**Change**
+- `keybuf` created **without PRIMARY KEY**.
+- Dedup done in Python before insert.
+- Avoids btree maintenance costs inside temp table.
+
+**Rationale**
+- For large key inserts into temp table, a PK can be a net loss.
+- Since you already dedup keys, PK is redundant.
+
+**Impact**
+- Reduced overhead of the JOIN path.
+- Still can be slower than OR when key sets are small.
+
+**Safety**
+- Correctness unchanged: join result correctness does not require keybuf PK.
+- Explosion risk is still guarded by outpoints PK uniqueness.
+
+---
+
+### C4) Hybrid lookup strategy (preserved in final)
+**Change**
+- `lookup_outpoints_hybrid` chooses:
+  - OR strategy if `len(keys) < PREVOUT_HYBRID_THRESHOLD`
+  - JOIN strategy otherwise
+
+**Rationale**
+- Best of both worlds:
+  - OR wins small
+  - JOIN wins big
+
+**Impact**
+- Usually improves overall runtime stability across varying file sizes.
+- Threshold tuning matters:
+  - If threshold too low → too many JOIN calls (overhead)
+  - If too high → OR clauses become too big (SQL overhead)
+
+**Safety**
+- Correctness unchanged; only the query method changes.
+
+**Preserved**
+- Dedup semantics and returned mapping type.
+
+---
+
+## Change Set D — Python overhead reductions inside the per-file loop
+
+### D1) Avoid `named=True` in `iter_rows`
+**Change**
+- Use `named=False` wherever possible.
+
+**Rationale**
+- Named rows allocate dict-like structures and slow Python iteration.
+
+**Impact**
+- Minor-to-moderate speedup depending on row counts.
+
+**Safety**
+- No logic change; just row unpacking style.
+
+---
+
+### D2) Add `buffer_size` in `iter_rows`
+**Change**
+- Use large buffer sizes (e.g. 200k) to reduce cross-language call overhead.
+
+**Rationale**
+- Polars → Python iteration overhead becomes a bottleneck with many small calls.
+
+**Impact**
+- Typically helpful, but large buffers can increase memory spikes.
+
+**Safety**
+- No logic change.
+
+---
+
+### D3) Reduce per-file `gc.collect()`
+**Change**
+- Move from “collect every file” to “collect every N files”.
+
+**Rationale**
+- Full GC is expensive; repeated calls can slow the loop substantially.
+
+**Impact**
+- Can reduce runtime if GC was invoked too aggressively.
+- Tradeoff: higher peak memory.
+
+**Safety**
+- No correctness change.
+
+---
+
+## Change Set E — `dir` normalization optimization
+
+### E1) Detect if normalization is needed once
+**Change**
+- On first file, inspect `dir` uniques and set `DIR_NEEDS_NORMALIZATION`.
+- Only apply lowercasing if it is actually needed.
+
+**Rationale**
+- Doing `.str.to_lowercase()` on every file can be expensive.
+
+**Impact**
+- Small but real speed win if source already uses lowercased `'in'/'out'`.
+
+**Safety**
+- Preserves correctness:
+  - normalization applied when needed
+  - otherwise no-op
+
+---
+
+## Change Set F — Post-run sanity checks (validation layer)
+
+### F1) Cluster sanity summary (`run_sanity_checks`)
+**Change**
+- Added a post-run check that:
+  - reconstructs cluster size distribution using `Counter(node_to_entity)`
+  - verifies `sum(sizes) == n_nodes`
+  - prints top-k cluster sizes and percentiles
+  - prints DB prevout hit rate
+
+**Rationale**
+- Detect silent mapping bugs early.
+
+**Impact**
+- Minimal runtime overhead (postprocessing only).
+- Increases confidence and debuggability.
+
+**Safety**
+- Read-only checks; no mutations.
+
+---
+
+### F2) Prevout sanity checks
+**Two modes**
+1. **Within-file Polars join sanity**
+   - checks integer-likeness of `prev_vout`
+   - checks duplicate outpoints `(txid,n)` inside file
+   - joins vin→vout within same parquet (limited scope)
+
+2. **DB-based sanity (recommended)**
+   - samples vin rows from one parquet
+   - runs actual DB lookup
+   - reports hit-rate and unresolved examples
+
+**Rationale**
+- Validate that your input schema and join keys behave as expected.
+
+**Impact**
+- Optional. DB sanity costs one extra lookup pass on a sample.
+
+**Safety**
+- Read-only.
+
+---
+
+## Net Results Summary (based on your measured runs)
+
+### Runtime outcome
+- Updated patched version: **~20:30**
+- Baseline version: **~19:45**
+
+So the patched version, in your environment, is **~45s slower**.
+
+### Most likely reasons the “patched” variant did not win
+- JOIN path overhead (temp table delete + insert + join) can dominate if many files have “medium” key counts.
+- `tqdm` overhead (even reduced) + extra conditional logic adds small but steady cost.
+- Larger Python-side list building (`keys`, `rows`) and extra bookkeeping.
+- SQLite’s OR lookup may already be “good enough” for your key sizes, so the hybrid adds overhead without crossing the threshold where JOIN wins.
+
+---
+
+## What was preserved (invariants across changes)
+
+### Heuristics preserved
+- CoinJoin-like skip heuristic (same definition).
+- Multi-input heuristic union logic.
+- Conservative change union gates and logic:
+  - dust threshold use
+  - fee sanity
+  - type checks
+  - newness constraint logic
+  - shape constraints (2–3 spendable outs)
+  - complexity caps (max inputs)
+
+### Data model preserved
+- Outpoint identity: `(txid, n)` primary key.
+- Outpoint values: `(address, value_sats)` stored in SQLite.
+- Address→UF node creation behavior.
+- Node flags semantics.
+
+### Output preserved
+- Entity clustering logic (UF + root compaction).
+- Mapping file format and compression.
+- Plot outputs.
+
+---
+
+## What was mainly changed (final state)
+
+### Main functional additions
+- **Sanity checks** (cluster and prevout) after run.
+
+### Main performance-related modifications
+- **Periodic commits** instead of per-file commits.
+- **Hybrid prevout lookup** (OR for small, JOIN for large).
+- Reduced Python iteration overhead (buffer sizes, no named rows).
+- Reduced normalization work (conditional `dir` normalization).
+- Reduced `gc.collect()` frequency.
+- `tqdm` with throttled updates.
+
+---
+
+## Recommendation (practical)
+
+If your goal is **pure speed**, the simplest “best bet” in your measurements is:
+
+- Keep **periodic commits** (B1).
+- Keep **OR lookup** as default, and set:
+  - `PREVOUT_HYBRID_THRESHOLD` high enough that JOIN is rarely used, *unless you confirm JOIN is faster* on your workload.
+- Keep low-overhead `tqdm` settings.
+
+If your goal is **robustness + confidence**, keep the sanity checks—they’re low risk and high value.
+
+If you want, collect:
+- the distribution of `len(needed_keys)` per file (min/median/p90/max)
+
+…and use it to choose a data-driven `PREVOUT_HYBRID_THRESHOLD` and chunk sizes.
+
 
 # Patch Note #1
 
