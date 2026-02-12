@@ -910,3 +910,243 @@ The following design constraints were intentionally preserved:
    - Validate proxy with any available labels or with manual inspection of known services/exchanges.
 
 ---
+
+# Patch Note 2:
+
+# Experiment Change Log (What changed, impact, what we preserved)
+
+This run consolidates multiple experimental patches into a single-year pipeline. Below is a **markdown-style change log** describing:
+
+- **Main changes** (behavioral + instrumentation)
+- **How they affect results** (what will change in outputs/metrics, and why)
+- **What was preserved** (core invariants and safety constraints)
+
+> Note: Where “impact” refers to quantitative changes, the code now **logs and writes the necessary artifacts** to verify them (instead of asserting numbers without seeing your actual run outputs).
+
+---
+
+## Baseline (implicit reference point)
+
+### Core behavior
+- Build an address-level Union-Find clustering with:
+  - **H1** multi-input heuristic unions (inputs co-spent → cluster).
+  - **CHANGE** unions (input anchor → inferred change output) gated by rules and a change model.
+- Maintain an **outpoint database** (txid, n → address, value) to resolve inputs.
+- Use **merge guards** to prevent pathological growth (caps, ratio guard, voting, degree guard).
+
+### Key limitations that motivated the patches
+- Change detection “precision” could not be audited cleanly (accepted vs rejected were not sampled symmetrically).
+- Hard gating on script-type properties could be brittle across years (especially early years).
+- Acceptance thresholds were effectively fixed/tuned, not year-adaptive.
+- No “strong-ish” ground truth to evaluate change model quality beyond proxy labels.
+
+---
+
+## Patch 1 — Change precision audit (accepted vs rejected)
+
+### What changed
+- Added a **balanced reservoir sample** of change-scored transactions:
+  - **Accepted samples**: up to `sample_n_each`
+  - **Rejected samples**: up to `sample_n_each`
+- Writes a Parquet audit dataset and generates **audit plots**.
+
+### New artifacts
+- `change_audit_<year>.parquet`
+- Plots:
+  - `audit_plots/change_audit_pbest_<year>.png`
+  - `audit_plots/change_audit_fee_frac_<year>.png`
+  - `audit_plots/change_audit_feature_rates_<year>.png`
+
+### How it affects results
+- **No behavioral change** to clustering.
+- **Big change to observability**:
+  - You now see whether rejected cases differ meaningfully from accepted cases (e.g., fee regime, value regime, “newness”, “min output” bias).
+  - You can directly inspect whether the model is accepting “obviously wrong” candidates (e.g., high fee_frac, non-new outputs).
+
+### What was preserved
+- Same clustering logic.
+- Same “change model” decision pipeline (this patch is instrumentation only).
+
+---
+
+## Patch 2 — Online quantile calibration for acceptance threshold (`p_accept`) (and optional `p_gap`)
+
+### What changed
+- Replaced static acceptance decisioning with a **rolling quantile threshold**:
+  - `p_accept_cal`: maintains a running estimate of the chosen quantile of `p_best`
+  - Optionally `p_gap_cal` (currently disabled in config, but supported)
+- Threshold updates are:
+  - **Windowed** (ring buffer)
+  - **Periodic** (`update_every`)
+  - **Warmup-gated** (`warmup_min_samples`)
+  - **Clamped** (`min/max`) for safety
+
+### How it affects results
+- **Year-adaptive acceptance rate**:
+  - In years where scores shift (feature distributions change, address types change), acceptance no longer depends on a fixed global cutoff.
+- Expected behavioral impacts:
+  - **More stable “easy acceptance rate” across days** (less sensitivity to early/late-year regime shifts).
+  - Potentially **different count** of change-detected txs vs baseline:
+    - If the score distribution is compressed: acceptance threshold drops (within clamps) → **more change unions**.
+    - If the score distribution is inflated: threshold rises → **fewer change unions**.
+- What you should look at:
+  - Console prints:
+    - `easy_seen`, `easy_accepted`, acceptance rate
+    - final `p_accept_threshold`, `p_gap_threshold`
+  - The audit Parquet + plots (Patch 1) to ensure “more accepted” doesn’t mean “worse precision”.
+
+### What was preserved
+- Same scoring function (logit) and features (modulo Patch 2–3 below).
+- Merge guards still apply; adaptive acceptance does **not** bypass safety.
+
+---
+
+## Patch 2–3 — Convert hard gates to features (remove brittle candidate dropping)
+
+This is the main *behavioral* change to the change heuristic.
+
+### What changed
+Previously, some script-type checks could effectively *discard* candidates / transactions. Now they become **model features** so the model can down-weight them instead of hard-rejecting.
+
+#### 1) `in_type_uniform` becomes a feature (not a hard reject)
+- Before: non-uniform input script types might be rejected early.
+- Now: `in_type_uniform ∈ {0,1}` is fed into the model.
+
+#### 2) Output-type matching is no longer used to drop candidates
+- Before: if output type didn’t match “input type”, a candidate might be removed.
+- Now: each output has:
+  - `out_type_match_in` feature
+  - `type_mismatch` penalty feature
+
+#### 3) Add script-type entropy features
+- New features:
+  - `type_entropy_in` (normalized entropy of input types)
+  - `type_entropy_out` (entropy of output types)
+  - `type_entropy_delta = H_out - H_in`
+
+### How it affects results
+- **Higher recall / coverage** in years or regimes where script-type assumptions are weaker.
+- Reduced brittle failures due to:
+  - heterogeneous input types
+  - mixed output types
+  - evolving script adoption patterns
+- Risks / tradeoffs:
+  - Recall increases can reduce precision if weights are not well-tuned.
+  - That’s why Patch 1 (audit) and Patch A (labels) are important.
+
+### What was preserved
+- Still retains key “sanity gates”:
+  - output must not be one of the input addresses
+  - spendable outputs must be distinct
+  - fee constraints still enforced
+  - 2-output constraint (if enabled) preserved
+  - coinjoin/mixing-like filter preserved (if enabled)
+
+---
+
+## Patch A — “First-spend linkage” labeling (outpoint-level, stronger signal)
+
+### What changed
+Added a post-hoc labeling mechanism to approximate a stronger “change vs not-change” signal.
+
+#### Key idea
+For sampled accepted txs and near-threshold rejected txs:
+- Track each output **by outpoint** `(txid, n)`
+- Find that outpoint’s **first spend**
+- Label output as “change” (`label=1`) if the first-spend transaction co-spends with an input that belongs to the original tx’s **H1-only input cluster** (to avoid leakage from CHANGE edges)
+
+#### Important detail (preserved correctness)
+- Uses **H1-only UF (`uf_h1`)** for anchor cluster membership, not the full UF.
+  - This prevents circularity where your own change edges would “confirm themselves”.
+
+### New artifacts
+- `firstspend_labels_<year>.parquet`
+  - includes `out0_label_fs`, `out1_label_fs` plus first-spend txid/day when observed
+
+### How it affects results
+- **No change to clustering decisions** (labels are evaluation-only).
+- Big change to model evaluation quality:
+  - You can now evaluate whether `p(output)` correlates with a plausibly-causal linkage signal.
+  - You get both:
+    - **accepted** cases
+    - **near-threshold rejected** cases (critical for tuning)
+
+### What was preserved
+- No feedback loop into model during the run. Labels are computed *after*.
+- Uses within-year scan; does not require external datasets.
+
+---
+
+## Additional preserved invariants (still true after all changes)
+
+### Safety / anti-explosion controls
+- Absolute cap on merged component size.
+- Ratio guard for CHANGE merges.
+- Vote-gated merges for large components.
+- Degree guard for CHANGE to prevent “hub” explosions.
+- Coinjoin/mixing-like filter preserved (if enabled).
+
+### Determinism & repeatability
+- Seeded reservoir sampling.
+- Seeded numpy / random.
+- Deterministic quantile estimation via `np.partition` on buffer copies.
+
+### Output data contracts
+- Still produces:
+  - entity mapping (address → entity_id)
+  - (optional) confidence proxy parquet
+
+---
+
+## What *should* differ in your results (expected directional changes)
+
+These are the expected “result deltas” you should see when comparing to the prior baseline run:
+
+1. **Count of change-detected transactions (`n_txs_with_change_detected`)**
+   - Likely changes due to:
+     - adaptive `p_accept`
+     - removal of hard type-gates → more eligible txs
+
+2. **Distribution of accepted `p_best`**
+   - With quantile acceptance, accepted `p_best` will track the score distribution:
+     - threshold ≈ target quantile (within clamps)
+
+3. **Composition of accepted change edges**
+   - More heterogenous script-type patterns should appear among accepted edges
+   - Audit plots should show whether these new accepts look “reasonable” on fee/value/newness
+
+4. **Model quality checks (evaluation)**
+   - Proxy eval (min-output) still available
+   - First-spend eval (Patch A) becomes the main sanity check for calibration/ROC
+
+---
+
+## “Eventually preserved” decisions (what we intentionally did *not* change)
+
+- Kept the **core clustering approach**: UF + H1 + optional CHANGE.
+- Kept the **coinjoin avoidance strategy** (mixing-like filter).
+- Kept the **fee sanity constraints** (absolute and fractional caps).
+- Kept **2-output-only change inference** (when `change_require_2_outputs=True`).
+- Kept **merge guards** as hard constraints regardless of acceptance changes.
+- Kept a **simple logistic model** (interpretable, cheap, stable) rather than switching to a black-box or re-training inline.
+
+---
+
+## Minimal checklist for interpreting “impact” from your run
+
+Use these in order:
+
+1. **Console diagnostics**
+   - `easy_seen`, `easy_accepted`, rate
+   - final `p_accept_threshold`, `p_gap_threshold`
+   - `n_txs_with_change_detected`
+
+2. **Patch 1 audit plots**
+   - Check if rejected vs accepted separations look sane:
+     - fee_frac: accepted should skew lower
+     - cand_new / optimal_ok: accepted should skew higher
+
+3. **Patch A evaluation plots**
+   - First-spend ROC and calibration are the best “does it work?” signals.
+
+---
