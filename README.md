@@ -1150,3 +1150,164 @@ Use these in order:
    - First-spend ROC and calibration are the best “does it work?” signals.
 
 ---
+
+# Experiment change log (focus: 2013 run + Patch-A fix)
+
+## Summary
+
+The 2013 pipeline produced **valid entity clustering + change detection**, but **Patch-A forward labeling produced zero labels** (`pos=0, neg=0, unl=80,000`). The root cause was a **mathematical impossibility** in how repeat-evidence `k` was defined (outpoint-level). The patch redefines `k` at the **address level** and adds **sanity counters** so “all-unlabeled” failures cannot occur silently again.
+
+---
+
+## Change log
+
+### 1) BTC value unit handling was made explicit and non-inferential ✅
+
+**What changed**
+- Value fields are treated as **BTC floats** and converted deterministically into **satoshis ints** (`value_sats = round(value * 1e8)`).
+- Removed any “guessing” logic about whether the input was already sats vs BTC.
+
+**Why**
+- Prevents silent unit mistakes (the worst possible failure mode).
+
+**Impact observed**
+- Sanity checks show output values in plausible ranges:
+  - `max(value_sats)` in first file and maximum seen output remain well below `2.1e15 sats`.
+
+**Preserved**
+- The pipeline still uses the same Parquet IO structure and outpoint DB approach; only conversion rules are hardened.
+
+---
+
+### 2) Change detection thresholds remained stable and behaved as expected ✅
+
+**What changed**
+- No core threshold logic change; the run shows:
+  - `p_gap` fixed at `0.1000`
+  - `p_accept` calibrator updates over the year (`~0.722 → ~0.744`)
+
+**Impact observed (2013)**
+- Change detected (tight): **116,003**
+- Accepted rate stayed around ~1% daily (per evolution log).
+- Change-audit distributions show clear separation:
+  - accepted `p_best` centered around ~0.74
+  - rejected `p_best` centered around ~0.59
+  - accepted `fee_frac` much lower than rejected
+
+**Preserved**
+- Same model scoring, same acceptance criteria: `(p_best >= p_accept) & (p_gap >= threshold)`.
+
+---
+
+### 3) Entity clustering remained consistent; heavy-tail distribution validated ✅
+
+**What changed**
+- No clustering logic change in this patch set; results are mainly validation + reporting.
+
+**Impact observed (2013)**
+- Nodes / clusters:
+  - UF nodes: **22,044,084**
+  - Entities: **14,939,284**
+  - Largest cluster: **912,929** (~4.14% of nodes)
+  - Median cluster size: **1**
+  - 99th percentile: **4**
+- Distribution plots show expected heavy-tail / Zipf-like behavior.
+
+**Preserved**
+- Core union rules:
+  - H1 multi-input unions dominate (`~7.0M`)
+  - Change unions are smaller but non-trivial (`~103k`)
+
+---
+
+### 4) Patch-A forward labeling bug fix: redefine repeat evidence `k` at address level ✅ (critical)
+
+**What changed**
+- **Old behavior (bug):** `k_pos=2, k_neg=2` was applied at the **outpoint** level.
+  - But an outpoint `(txid, n)` can be spent **at most once**, so “require ≥2 future spends” is impossible.
+- **New behavior (fix):** `k_pos/k_neg` is applied at the **address level**:
+  - For each candidate output address, count distinct future spend transactions in the window where the address appears as an input and satisfies evidence conditions.
+  - Labels derive from address-level rejoin counts.
+
+**Why**
+- Fixes a hard mathematical impossibility that guarantees `pos=0, neg=0` regardless of data.
+
+**Expected impact**
+- Labeling will produce non-zero `pos/neg` **if** candidate addresses have rejoin evidence ≥ thresholds.
+- If the data still cannot support `k_pos=2`, the new sanity quantiles will immediately reveal it (e.g., `max(rejoin_count)=1`).
+
+**Preserved**
+- The Patch-A conceptual goal stays the same: use future “rejoin” evidence to label candidate outputs.
+- The sampling regime (accepted + near-reject reservoirs) is preserved; only the interpretation of repeat evidence changes.
+
+---
+
+### 5) Patch-A observability & evidence sanity counters added ✅
+
+**What changed**
+Patch-A forward scan now prints:
+
+**Coverage**
+- `n_candidates_outpoints`
+- `n_candidates_addrs_unique`
+
+**Spend observability**
+- `n_candidate_outpoints_spent_within_window`
+- `n_candidate_addrs_seen_as_input_within_window`
+
+**Evidence availability**
+- `n_spend_txs_where_candidate_addr_is_input`
+- `n_spend_txs_candidate_and_has_other_inputs`
+- `n_spend_txs_candidate_and_other_inputs_resolved`
+- `n_spend_txs_candidate_with_anchor_intersection`
+
+**Rejoin-count distribution**
+- Quantiles and max over `rejoin_count[address]` among candidates:
+  - `q50 / q90 / q99 / max`
+
+**Why**
+- Eliminates the “silent all-unlabeled” failure mode:
+  - you can immediately see if candidates are ever spent in-window,
+  - whether spends have multi-input structure,
+  - whether DB resolution is sufficient,
+  - whether intersection evidence ever occurs,
+  - and whether `k_pos` is even feasible.
+
+**Preserved**
+- Output format remains Parquet; only additional columns/counters were introduced.
+
+---
+
+### 6) What remained intentionally unchanged (to keep continuity)
+
+- **Change scoring model** and acceptance gating.
+- **CoinJoin/mixing-like filter behavior** (unless you later choose to tune it).
+- **H1 safe multi-input policy** and union-guard mechanics.
+- **Entity compression and mapping writeout**.
+- **Confidence proxy generation**.
+
+---
+
+## Net effect on the 2013 run interpretation
+
+- Your 2013 run is **internally consistent** on:
+  - value units,
+  - prevout DB hit rate (~99%),
+  - entity size heavy-tail,
+  - change scoring separation (audit plots),
+  - change union counts.
+
+- The **only “hard failure”** was Patch-A labels being all unlabeled, and that is now addressed by:
+  - fixing the `k` definition (address-level),
+  - adding observability and feasibility telemetry (quantiles + counters).
+
+---
+
+## What to look for on the next 2013 rerun (post-patch)
+
+You should expect Patch-A to print:
+- non-trivial `n_candidate_addrs_seen_as_input_within_window`
+- meaningful `rejoin_count[address]` max/quantiles
+- and **either**:
+  - `pos/neg > 0` if `max(rejoin_count) >= k_pos` **and** anchor intersections happen, **or**
+  - a clear warning like `max(rejoin_count) < k_pos` indicating thresholds still too high for that year/window.
